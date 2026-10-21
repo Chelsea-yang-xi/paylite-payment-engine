@@ -1,0 +1,35 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+paylite.db
+.env
+archive/main_original.py
+archive/client_original.py
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE and OS
+.idea/
+.DS_Store
+
+# Secrets
+.env
+.env.*
+!.env.example
