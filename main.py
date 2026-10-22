@@ -50,6 +50,23 @@ def audit(actor, payment_id, action, old_status, new_status):
     conn.close()
 
 
+def insert_audit(conn, actor, payment_id, action, old_status, new_status):
+    conn.execute(
+        """
+        INSERT INTO audit_log
+        (ts, actor, payment_id, action, old_status, new_status)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now().isoformat(),
+            actor,
+            payment_id,
+            action,
+            old_status,
+            new_status,
+        ),
+    )
+
 # ============ D2: 限流器 (固定窗口) ============
 WINDOW = 60
 LIMIT = 5
@@ -114,28 +131,82 @@ def _is_same_payment_request(existing_row, payment_request):
 
 
 # ============ D1: 同步支付 (幂等) ============
+
 @app.post("/payments")
 def create_payment(p: PaymentRequest):
     if not allow_request(p.merchant):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT id, amount, currency, merchant, status FROM payments WHERE idempotency_key = ?",
-                (p.idempotency_key,))
-    existing = cur.fetchone()
-    if existing is not None:
-        conn.close()
-        if _is_same_payment_request(existing, p):
-            return {"payment_id": existing[0], "status": existing[4], "replayed": True}
-        raise HTTPException(status_code=409, detail="Idempotency key already used for a different request")
-    cur.execute("INSERT INTO payments (idempotency_key, amount, currency, merchant, status) VALUES (?, ?, ?, ?, ?)",
-                (p.idempotency_key, p.amount, p.currency, p.merchant, "COMPLETED"))
-    conn.commit()
-    new_id = cur.lastrowid
-    conn.close()
-    audit("api", new_id, "CREATE", None, "COMPLETED")
-    return {"payment_id": new_id, "status": "COMPLETED", "replayed": False}
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded"
+        )
 
+    conn = sqlite3.connect(DB)
+
+    try:
+        # Explicit transaction boundary
+        conn.execute("BEGIN IMMEDIATE")
+
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, amount, currency, merchant, status
+            FROM payments
+            WHERE idempotency_key = ?
+            """,
+            (p.idempotency_key,)
+        )
+        existing = cur.fetchone()
+
+        if existing is not None:
+            if _is_same_payment_request(existing, p):
+                return {
+                    "payment_id": existing[0],
+                    "status": existing[4],
+                    "replayed": True
+                }
+
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency key already used for a different request"
+            )
+
+        cur.execute(
+            """
+            INSERT INTO payments
+            (idempotency_key, amount, currency, merchant, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                p.idempotency_key,
+                p.amount,
+                p.currency,
+                p.merchant,
+                "COMPLETED"
+            )
+        )
+
+        payment_id = cur.lastrowid
+
+        # Same connection, same transaction
+        insert_audit(
+            conn, "api", payment_id,
+            "CREATE", None, "COMPLETED"
+        )
+
+        conn.commit()
+
+        return {
+            "payment_id": payment_id,
+            "status": "COMPLETED",
+            "replayed": False
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
 # ============ D3: 异步支付 (幂等 + 队列) ============
 @app.post("/payments/async")
