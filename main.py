@@ -1,60 +1,124 @@
+
 import sqlite3
 import time
 import threading
 import random
-from collections import deque
+
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
-app = FastAPI()
+# ==================================================
+# 1. FastAPI Application
+# ==================================================
+
+app = FastAPI(
+    title="Paylite Payment Engine",
+    description="A payment processing engine for backend engineering practice.",
+    version="0.6.0",
+)
+
 DB = "paylite.db"
 
 
-# ============ 建表 (Day 18 模板) ============
+# ==================================================
+# 2. Database Connection & Initialization
+# ==================================================
+
+def get_connection():
+    """
+    Create a SQLite database connection.
+
+    timeout allows a request to wait briefly when another
+    transaction holds the database write lock.
+    """
+    return sqlite3.connect(DB, timeout=10.0)
+
+
 def init_db():
-    conn = sqlite3.connect(DB)
-    conn.execute("""CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY,
-        idempotency_key TEXT UNIQUE,
-        amount INTEGER,
-        currency TEXT,
-        merchant TEXT,
-        status TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS audit_log (
-        id INTEGER PRIMARY KEY, ts TEXT, actor TEXT,
-        payment_id INTEGER, action TEXT, old_status TEXT, new_status TEXT
-    )""")
-    conn.commit()
-    conn.close()
+    conn = get_connection()
+
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY,
+                idempotency_key TEXT UNIQUE,
+                amount INTEGER,
+                currency TEXT,
+                merchant TEXT,
+                status TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY,
+                ts TEXT,
+                actor TEXT,
+                payment_id INTEGER,
+                action TEXT,
+                old_status TEXT,
+                new_status TEXT
+            )
+        """)
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
 
 init_db()
 
 
+# ==================================================
+# 3. Payment Request Model
+# ==================================================
+
 class PaymentRequest(BaseModel):
     idempotency_key: str
-    amount: int          # 单位:分! 899.99欧 = 89999
+    amount: int
     currency: str
     merchant: str
 
 
-# ============ D4: 审计留痕 (只INSERT,永不改删) ============
-def audit(actor, payment_id, action, old_status, new_status):
-    conn = sqlite3.connect(DB)
-    conn.execute("INSERT INTO audit_log (ts, actor, payment_id, action, old_status, new_status) VALUES (?, ?, ?, ?, ?, ?)",
-                 (datetime.now().isoformat(), actor, payment_id, action, old_status, new_status))
-    conn.commit()
-    conn.close()
+# ==================================================
+# 4. Audit Logging
+# ==================================================
 
+def insert_audit(
+        conn,
+        actor,
+        payment_id,
+        action,
+        old_status,
+        new_status,
+):
+    """
+    Insert an audit record using the caller's connection.
 
-def insert_audit(conn, actor, payment_id, action, old_status, new_status):
+    IMPORTANT:
+    This function does not call commit().
+    Payment changes and audit records can therefore
+    belong to the same database transaction.
+    """
+
     conn.execute(
         """
         INSERT INTO audit_log
-        (ts, actor, payment_id, action, old_status, new_status)
+        (
+            ts,
+            actor,
+            payment_id,
+            action,
+            old_status,
+            new_status
+        )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
@@ -67,113 +131,250 @@ def insert_audit(conn, actor, payment_id, action, old_status, new_status):
         ),
     )
 
-# ============ D2: 限流器 (固定窗口) ============
+
+def audit(
+        actor,
+        payment_id,
+        action,
+        old_status,
+        new_status,
+):
+    """
+    Standalone audit helper.
+
+    Prefer insert_audit(conn, ...) when audit logging
+    must share a transaction with payment updates.
+    """
+
+    conn = get_connection()
+
+    try:
+        insert_audit(
+            conn,
+            actor,
+            payment_id,
+            action,
+            old_status,
+            new_status,
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+# ==================================================
+# 5. Rate Limiting
+# ==================================================
+
 WINDOW = 60
 LIMIT = 5
+
 buckets = {}
+rate_lock = threading.Lock()
 
 
 def allow_request(merchant):
+    """
+    Fixed-window rate limiter.
+
+    Maximum:
+        5 requests per merchant per 60 seconds.
+
+    Uses a threading lock for safety within
+    a single Python process.
+    """
+
     now = time.time()
-    if merchant not in buckets:
-        buckets[merchant] = [now, 1]
-        return True
-    start, count = buckets[merchant]
-    if now - start > WINDOW:
-        buckets[merchant] = [now, 1]
-        return True
-    if count < LIMIT:
-        buckets[merchant][1] += 1
-        return True
-    return False
+
+    with rate_lock:
+
+        if merchant not in buckets:
+            buckets[merchant] = [now, 1]
+            return True
+
+        start, count = buckets[merchant]
+
+        if now - start >= WINDOW:
+            buckets[merchant] = [now, 1]
+            return True
+
+        if count < LIMIT:
+            buckets[merchant][1] += 1
+            return True
+
+        return False
 
 
-# ============ D2: TTL 缓存 ============
+# ==================================================
+# 6. TTL Cache
+# ==================================================
+
 cache = {}
 TTL = 5
+cache_lock = threading.Lock()
 
 
-# ============ D3: 队列 + 后台工人 ============
-task_queue = deque()
+def get_cached_payment(payment_id):
+    now = time.monotonic()
 
+    with cache_lock:
+        entry = cache.get(payment_id)
+
+        if entry is None:
+            return None
+
+        data, expiry = entry
+
+        if now < expiry:
+            return data
+
+        cache.pop(payment_id, None)
+
+    return None
+
+
+def invalidate_payment_cache(payment_id):
+    with cache_lock:
+        cache.pop(payment_id, None)
+
+
+# ==================================================
+# 7. Simulated Bank Processing
+# ==================================================
 
 def process_with_bank(payment_id):
-    """模拟银行扣款: 耗时2-4秒, 90%成功"""
+    """
+    Simulates an external banking operation.
+
+    Processing time:
+        2-4 seconds.
+
+    Result:
+        90% COMPLETED
+        10% FAILED
+
+    No real payment or money transfer occurs.
+    """
+
     time.sleep(random.uniform(2, 4))
-    return "COMPLETED" if random.random() < 0.9 else "FAILED"
+
+    if random.random() < 0.9:
+        return "COMPLETED"
+
+    return "FAILED"
 
 
-def worker_loop():
-    print("[WORKER] 后台工人上岗")
-    while True:
-        if len(task_queue) == 0:
-            time.sleep(0.2)
-            continue
-        pid = task_queue.popleft()
-        print(f"[WORKER] 开始处理 payment {pid} ...")
-        final = process_with_bank(pid)
-        conn = sqlite3.connect(DB)
-        conn.execute("UPDATE payments SET status = ? WHERE id = ?", (final, pid))
-        conn.commit()
-        conn.close()
-        audit("worker", pid, "PROCESS", "PENDING", final)   # ← 你推导出的那行!
-        print(f"[WORKER] payment {pid} -> {final}")
+# ==================================================
+# 8. Idempotency Helper
+# ==================================================
 
+def _is_same_payment_request(
+        existing_row,
+        payment_request,
+):
+    """
+    Compare the stored payment with an incoming request.
 
-threading.Thread(target=worker_loop, daemon=True).start()
+    The idempotency key must not be reused for
+    a different payment payload.
+    """
 
-
-def _is_same_payment_request(existing_row, payment_request):
     if existing_row is None:
         return False
+
     _, amount, currency, merchant, _ = existing_row
-    return (amount, currency, merchant) == (payment_request.amount, payment_request.currency, payment_request.merchant)
+
+    return (
+        amount,
+        currency,
+        merchant,
+    ) == (
+        payment_request.amount,
+        payment_request.currency,
+        payment_request.merchant,
+    )
 
 
-# ============ D1: 同步支付 (幂等) ============
+# ==================================================
+# 9. Synchronous Payment API
+# ==================================================
 
 @app.post("/payments")
 def create_payment(p: PaymentRequest):
+    """
+    Create a synchronous payment.
+
+    Guarantees within this SQLite prototype:
+
+    - Database uniqueness for idempotency keys
+    - Serialized SQLite write transactions
+    - Atomic payment creation and audit logging
+    """
+
     if not allow_request(p.merchant):
         raise HTTPException(
             status_code=429,
-            detail="Rate limit exceeded"
+            detail="Rate limit exceeded",
         )
 
-    conn = sqlite3.connect(DB)
+    conn = get_connection()
 
     try:
-        # Explicit transaction boundary
         conn.execute("BEGIN IMMEDIATE")
 
         cur = conn.cursor()
+
         cur.execute(
             """
-            SELECT id, amount, currency, merchant, status
+            SELECT
+                id,
+                amount,
+                currency,
+                merchant,
+                status
             FROM payments
             WHERE idempotency_key = ?
             """,
-            (p.idempotency_key,)
+            (p.idempotency_key,),
         )
+
         existing = cur.fetchone()
 
         if existing is not None:
+
+            conn.rollback()
+
             if _is_same_payment_request(existing, p):
                 return {
                     "payment_id": existing[0],
                     "status": existing[4],
-                    "replayed": True
+                    "replayed": True,
                 }
 
             raise HTTPException(
                 status_code=409,
-                detail="Idempotency key already used for a different request"
+                detail=(
+                    "Idempotency key already used "
+                    "for a different request"
+                ),
             )
 
         cur.execute(
             """
             INSERT INTO payments
-            (idempotency_key, amount, currency, merchant, status)
+            (
+                idempotency_key,
+                amount,
+                currency,
+                merchant,
+                status
+            )
             VALUES (?, ?, ?, ?, ?)
             """,
             (
@@ -181,16 +382,19 @@ def create_payment(p: PaymentRequest):
                 p.amount,
                 p.currency,
                 p.merchant,
-                "COMPLETED"
-            )
+                "COMPLETED",
+            ),
         )
 
         payment_id = cur.lastrowid
 
-        # Same connection, same transaction
         insert_audit(
-            conn, "api", payment_id,
-            "CREATE", None, "COMPLETED"
+            conn,
+            "api",
+            payment_id,
+            "CREATE",
+            None,
+            "COMPLETED",
         )
 
         conn.commit()
@@ -198,7 +402,7 @@ def create_payment(p: PaymentRequest):
         return {
             "payment_id": payment_id,
             "status": "COMPLETED",
-            "replayed": False
+            "replayed": False,
         }
 
     except Exception:
@@ -208,79 +412,390 @@ def create_payment(p: PaymentRequest):
     finally:
         conn.close()
 
-# ============ D3: 异步支付 (幂等 + 队列) ============
+
+# ==================================================
+# 10. Asynchronous Payment API
+# ==================================================
+
 @app.post("/payments/async")
 def create_payment_async(p: PaymentRequest):
+    """
+    Create an asynchronous payment.
+
+    The payment is stored as PENDING.
+
+    The worker will later discover it directly
+    from the SQLite database.
+
+    No in-memory queue is required.
+    """
+
     if not allow_request(p.merchant):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT id, amount, currency, merchant, status FROM payments WHERE idempotency_key = ?",
-                (p.idempotency_key,))
-    existing = cur.fetchone()
-    if existing is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded",
+        )
+
+    conn = get_connection()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                id,
+                amount,
+                currency,
+                merchant,
+                status
+            FROM payments
+            WHERE idempotency_key = ?
+            """,
+            (p.idempotency_key,),
+        )
+
+        existing = cur.fetchone()
+
+        if existing is not None:
+
+            conn.rollback()
+
+            if _is_same_payment_request(existing, p):
+                return {
+                    "payment_id": existing[0],
+                    "status": existing[4],
+                    "replayed": True,
+                }
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Idempotency key already used "
+                    "for a different request"
+                ),
+            )
+
+        cur.execute(
+            """
+            INSERT INTO payments
+            (
+                idempotency_key,
+                amount,
+                currency,
+                merchant,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                p.idempotency_key,
+                p.amount,
+                p.currency,
+                p.merchant,
+                "PENDING",
+            ),
+        )
+
+        payment_id = cur.lastrowid
+
+        insert_audit(
+            conn,
+            "api",
+            payment_id,
+            "CREATE",
+            None,
+            "PENDING",
+        )
+
+        conn.commit()
+
+        return {
+            "payment_id": payment_id,
+            "status": "PENDING",
+            "replayed": False,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
         conn.close()
-        if _is_same_payment_request(existing, p):
-            return {"payment_id": existing[0], "status": existing[4], "replayed": True}
-        raise HTTPException(status_code=409, detail="Idempotency key already used for a different request")
-    cur.execute("INSERT INTO payments (idempotency_key, amount, currency, merchant, status) VALUES (?, ?, ?, ?, ?)",
-                (p.idempotency_key, p.amount, p.currency, p.merchant, "PENDING"))
-    conn.commit()
-    new_id = cur.lastrowid
-    conn.close()
-    audit("api", new_id, "CREATE", None, "PENDING")
-    task_queue.append(new_id)
-    return {"payment_id": new_id, "status": "PENDING", "replayed": False}
 
 
-# ============ D2: 查单 (带TTL缓存) ============
+# ==================================================
+# 11. Durable Worker Processing
+# ==================================================
+
+def process_next_pending():
+    """
+    Process one pending payment.
+
+    This implementation is intended for a
+    single worker process only.
+
+    Returns:
+        True  - payment processed
+        False - no eligible payment processed
+    """
+
+    conn = get_connection()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM payments
+            WHERE status = 'PENDING'
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+
+    finally:
+        conn.close()
+
+    if row is None:
+        return False
+
+    payment_id = row[0]
+
+    # Simulated external bank processing.
+    # An exception leaves the payment PENDING.
+    final_status = process_with_bank(payment_id)
+
+    if final_status not in (
+            "COMPLETED",
+            "FAILED",
+    ):
+        raise ValueError(
+            "Unexpected bank result"
+        )
+
+    conn = get_connection()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        cur = conn.execute(
+            """
+            UPDATE payments
+            SET status = ?
+            WHERE id = ?
+              AND status = 'PENDING'
+            """,
+            (
+                final_status,
+                payment_id,
+            ),
+        )
+
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False
+
+        insert_audit(
+            conn,
+            "worker",
+            payment_id,
+            "PROCESS",
+            "PENDING",
+            final_status,
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    invalidate_payment_cache(payment_id)
+
+    print(
+        f"[WORKER] Payment {payment_id} "
+        f"-> {final_status}"
+    )
+
+    return True
+
+
+# ==================================================
+# 12. Payment Query API
+# ==================================================
+
 @app.get("/payments/{payment_id}")
 def get_payment(payment_id: int):
-    now = time.time()
-    if payment_id in cache:
-        data, expiry = cache[payment_id]
-        if now < expiry:
-            print(f"[CACHE HIT] payment {payment_id}")
-            return data
-    print(f"[CACHE MISS] payment {payment_id} -> querying DB")
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT id, amount, currency, merchant, status FROM payments WHERE id = ?",
-                (payment_id,))
-    row = cur.fetchone()
-    conn.close()
+    """
+    Get payment details.
+
+    Uses a simple TTL cache to reduce
+    repeated database queries.
+    """
+
+    cached = get_cached_payment(payment_id)
+
+    if cached is not None:
+        print(
+            f"[CACHE HIT] Payment {payment_id}"
+        )
+        return cached
+
+    print(
+        f"[CACHE MISS] Payment {payment_id}"
+    )
+
+    conn = get_connection()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                id,
+                amount,
+                currency,
+                merchant,
+                status
+            FROM payments
+            WHERE id = ?
+            """,
+            (payment_id,),
+        ).fetchone()
+
+    finally:
+        conn.close()
+
     if row is None:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    result = {"id": row[0], "amount": row[1], "currency": row[2],
-              "merchant": row[3], "status": row[4]}
-    cache[payment_id] = (result, now + TTL)
+        raise HTTPException(
+            status_code=404,
+            detail="Payment not found",
+        )
+
+    result = {
+        "id": row[0],
+        "amount": row[1],
+        "currency": row[2],
+        "merchant": row[3],
+        "status": row[4],
+    }
+
+    with cache_lock:
+        cache[payment_id] = (
+            result,
+            time.monotonic() + TTL,
+        )
+
     return result
 
 
-# ============ D4: 审计查询 + 健康检查 ============
+# ==================================================
+# 13. Audit Query API
+# ==================================================
+
 @app.get("/payments/{payment_id}/audit")
 def get_audit(payment_id: int):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT ts, actor, action, old_status, new_status FROM audit_log WHERE payment_id = ? ORDER BY id",
-                (payment_id,))
-    rows = cur.fetchall()
-    conn.close()
-    result = []
-    for r in rows:
-        result.append({"ts": r[0], "actor": r[1], "action": r[2], "old": r[3], "new": r[4]})
-    return result
+    """
+    Return the audit history for a payment.
+    """
 
+    conn = get_connection()
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                ts,
+                actor,
+                action,
+                old_status,
+                new_status
+            FROM audit_log
+            WHERE payment_id = ?
+            ORDER BY id
+            """,
+            (payment_id,),
+        ).fetchall()
+
+    finally:
+        conn.close()
+
+    return [
+        {
+            "ts": row[0],
+            "actor": row[1],
+            "action": row[2],
+            "old": row[3],
+            "new": row[4],
+        }
+        for row in rows
+    ]
+
+
+# ==================================================
+# 14. Pending Payment Count
+# ==================================================
+
+def get_pending_count():
+    """
+    Count pending payments directly from SQLite.
+    """
+
+    conn = get_connection()
+
+    try:
+        count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM payments
+            WHERE status = 'PENDING'
+            """
+        ).fetchone()[0]
+
+        return count
+
+    finally:
+        conn.close()
+
+
+# ==================================================
+# 15. Health Check
+# ==================================================
 
 @app.get("/health")
 def health():
+    """
+    Report API database health and pending work.
+    """
+
     try:
-        conn = sqlite3.connect(DB)
-        conn.execute("SELECT 1")
-        conn.close()
+        conn = get_connection()
+
+        try:
+            conn.execute("SELECT 1")
+
+        finally:
+            conn.close()
+
         db_ok = True
+
     except Exception:
         db_ok = False
-    return {"status": "ok" if db_ok else "degraded",
-            "database": db_ok,
-            "queue_depth": len(task_queue)}
+
+    return {
+        "status": (
+            "ok"
+            if db_ok
+            else "degraded"
+        ),
+        "database": db_ok,
+        "pending_payments": (
+            get_pending_count()
+            if db_ok
+            else None
+        ),
+    }
